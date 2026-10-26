@@ -80,8 +80,29 @@ impl Database {
                 FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS run_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ingestion_jobs (
+                id TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                error_message TEXT,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_chunks_doc ON document_chunks(document_id);
             CREATE INDEX IF NOT EXISTS idx_msgs_conv ON messages(conversation_id);
+            CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id);
+            CREATE INDEX IF NOT EXISTS idx_ingestion_jobs_status ON ingestion_jobs(status);
             "#,
         )?;
         Ok(())
@@ -369,4 +390,79 @@ impl Database {
 
         Ok(msgs)
     }
+
+    // v11 Persistent Run Events (Section 10.3 & 12.3)
+    pub fn save_run_event(&self, run_id: &str, event_type: &str, payload_json: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO run_events (run_id, event_type, payload_json, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, event_type, payload_json, now],
+        )?;
+        let last_id = conn.last_insert_rowid() as u64;
+        Ok(last_id)
+    }
+
+    pub fn get_run_events(&self, run_id: &str, after_id: Option<u64>) -> Result<Vec<(u64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let min_id = after_id.unwrap_or(0) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT id, event_type, payload_json, created_at FROM run_events
+             WHERE run_id = ?1 AND id > ?2 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id, min_id], |row| {
+            let id_i64: i64 = row.get(0)?;
+            Ok((id_i64 as u64, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?;
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r?);
+        }
+        Ok(events)
+    }
+
+    // v11 Durable Ingestion Jobs (Section 6.3)
+    pub fn enqueue_ingestion_job(&self, id: &str, filename: &str, file_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO ingestion_jobs (id, filename, file_path, status, attempts, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5)",
+            params![id, filename, file_path, now, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn claim_next_ingestion_job(&self) -> Result<Option<(String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, filename, file_path FROM ingestion_jobs
+             WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let filename: String = row.get(1)?;
+            let file_path: String = row.get(2)?;
+            let now = Utc::now().to_rfc3339();
+            conn.execute(
+                "UPDATE ingestion_jobs SET status = 'processing', attempts = attempts + 1, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+            Ok(Some((id, filename, file_path)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn finish_ingestion_job(&self, id: &str, status: &str, error_message: Option<&str>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE ingestion_jobs SET status = ?1, error_message = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, error_message, now, id],
+        )?;
+        Ok(())
+    }
 }
+

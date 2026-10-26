@@ -214,3 +214,53 @@ fn sanitize_query(input: &str) -> String {
     }
     clean
 }
+
+/// Release 1 Registered Tool Contract (v11 Section 7.1 & 9.1)
+/// Only two tools are registered in Release 1:
+/// 1. hybrid_document_search
+/// 2. document_lookup
+/// Forbidden tools (web, sql, crm, mcp) are rejected at registry registration.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegisteredTool {
+    HybridDocumentSearch,
+    DocumentLookup,
+}
+
+pub struct ToolRegistry;
+
+impl ToolRegistry {
+    pub const APPROVED_TOOLS: &'static [&'static str] = &["hybrid_document_search", "document_lookup"];
+
+    pub fn is_tool_allowed(tool_name: &str) -> bool {
+        Self::APPROVED_TOOLS.contains(&tool_name)
+    }
+
+    pub fn assert_no_forbidden_tools(registered_names: &[&str]) -> Result<(), String> {
+        let forbidden = ["web_search", "sql_query", "crm_api", "mcp_tool", "bash_exec", "python_eval"];
+        for name in registered_names {
+            if forbidden.contains(name) {
+                return Err(format!(
+                    "Security violation: tool '{name}' is forbidden in Release 1 (violates v11 Section 7.1)"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_tool_registry_rejection() {
+        assert!(ToolRegistry::is_tool_allowed("hybrid_document_search"));
+        assert!(ToolRegistry::is_tool_allowed("document_lookup"));
+        assert!(!ToolRegistry::is_tool_allowed("web_search"));
+        assert!(!ToolRegistry::is_tool_allowed("sql_query"));
+
+        let bad_tools = vec!["hybrid_document_search", "web_search"];
+        assert!(ToolRegistry::assert_no_forbidden_tools(&bad_tools).is_err());
+    }
+}
+

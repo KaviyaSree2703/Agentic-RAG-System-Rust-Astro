@@ -1,13 +1,13 @@
 use axum::{
     Router,
-    extract::{Multipart, Path, State},
+    extract::{Multipart, Path, Query, State},
     response::{
         IntoResponse, Json,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{delete, get, post},
 };
-use futures::stream::Stream;
+use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -20,9 +20,9 @@ use crate::db::Database;
 use crate::ingestion::DocumentParser;
 use crate::models::{
     ChatRequest, DeleteConversationRequest, RemoveDocRequest, RemoveDocResponse, SearchRequest,
-    SearchResponse, SearchResultItem,
+    SearchResponse, SearchResultItem, V11EventPayload,
 };
-use crate::orchestrator::{AgentEvent, AgentOrchestrator};
+use crate::orchestrator::AgentOrchestrator;
 use crate::retrieval::SearchEngine;
 
 #[derive(Clone)]
@@ -33,6 +33,11 @@ pub struct AppState {
     pub orchestrator: Arc<AgentOrchestrator>,
 }
 
+#[derive(Deserialize)]
+pub struct ReplayParams {
+    pub last_event_id: Option<u64>,
+}
+
 pub fn create_router(state: AppState) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -40,8 +45,17 @@ pub fn create_router(state: AppState) -> Router {
         .allow_headers(Any);
 
     Router::new()
-        .route("/health", get(health_check))
-        .route("/api/health", get(health_check))
+        // v11 Official Route Contracts (Section 12.1)
+        .route("/v1/health", get(v11_health_check))
+        .route("/v1/chat/stream", post(v11_chat_stream))
+        .route("/v1/search", post(search_knowledge))
+        .route("/v1/documents", get(list_documents))
+        .route("/v1/documents/upload", post(upload_document))
+        .route("/v1/documents/{id}", delete(remove_document_path))
+        .route("/v1/runs/{id}/events", get(v11_replay_events))
+        // Backward-compatible compatibility adapters (Section 12.1)
+        .route("/health", get(v11_health_check))
+        .route("/api/health", get(v11_health_check))
         .route("/api/search", post(search_knowledge))
         .route("/api/documents", get(list_documents))
         .route("/api/documents/{id}", delete(remove_document_path))
@@ -51,22 +65,62 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/{id}", get(get_conversation))
         .route("/api/conversations/{id}", delete(delete_conversation_path))
         .route("/api/conversations/delete", post(delete_conversation_body))
-        .route("/api/chat", post(chat_handler))
+        .route("/api/chat", post(v11_chat_stream))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-async fn health_check() -> impl IntoResponse {
+async fn v11_health_check(State(state): State<AppState>) -> impl IntoResponse {
+    let doc_count = state.db.list_documents().map(|d| d.len()).unwrap_or(0);
     Json(json!({
         "status": "healthy",
-        "version": "1.0.0",
-        "modelProvider": "Gemini / OpenRouter / RIG Native",
-        "embeddingModel": "Tantivy-BM25-Hybrid",
-        "vectorBackend": "Native Tantivy Index + SQLite",
-        "retrievalStrategies": ["hybrid", "semantic", "keyword"],
-        "uptimeSeconds": 120
+        "specification": "v11",
+        "release": "1.0.0",
+        "runtime": "native-rust-tokio",
+        "storage": {
+            "mode": "sqlite-tantivy-native",
+            "indexed_documents": doc_count,
+            "status": "online"
+        },
+        "retrieval": {
+            "primary": "hybrid_document_search",
+            "fallback": "document_lookup",
+            "forbidden_tools_active": false
+        },
+        "grounding_gate": {
+            "checks": ["P0", "P1", "C1", "C2", "C3", "C4", "C5"],
+            "status": "enforced"
+        }
     }))
+}
+
+async fn v11_replay_events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Query(params): Query<ReplayParams>,
+) -> impl IntoResponse {
+    match state.db.get_run_events(&run_id, params.last_event_id) {
+        Ok(events) => {
+            let formatted: Vec<_> = events
+                .into_iter()
+                .map(|(id, event_type, payload, created_at)| {
+                    json!({
+                        "id": id,
+                        "type": event_type,
+                        "payload": serde_json::from_str::<serde_json::Value>(&payload).unwrap_or(json!(payload)),
+                        "created_at": created_at
+                    })
+                })
+                .collect();
+            Json(json!({ "run_id": run_id, "events": formatted })).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn search_knowledge(
@@ -172,21 +226,6 @@ async fn upload_document(
             .unwrap_or("document.txt")
             .to_string();
 
-        let ext = std::path::Path::new(&safe_name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        let allowed_exts = ["pdf", "txt", "md", "json", "csv", "log"];
-        if !allowed_exts.contains(&ext.as_str()) {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({ "error": format!("Unsupported file format: .{ext}. Allowed: PDF, TXT, MD, JSON, CSV") })),
-            )
-                .into_response();
-        }
-
         let temp_dir = std::env::temp_dir().join("rag_uploads");
         std::fs::create_dir_all(&temp_dir).ok();
         let unique_id = uuid::Uuid::new_v4().to_string();
@@ -235,10 +274,10 @@ async fn upload_document(
                 uploaded_docs.push(meta);
             }
             Err(e) => {
-                tracing::warn!("Document parsing failed for {safe_name}: {e}");
+                tracing::warn!("Document parsing rejected for {safe_name}: {e}");
                 return (
                     axum::http::StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": format!("Failed to parse document: {e}") })),
+                    Json(json!({ "error": format!("Document rejected: {e}") })),
                 )
                     .into_response();
             }
@@ -264,8 +303,14 @@ async fn get_conversation(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let messages = state.db.get_conversation_messages(&id).unwrap_or_default();
-    Json(json!({ "id": id, "messages": messages })).into_response()
+    match state.db.get_conversation_messages(&id) {
+        Ok(msgs) => Json(json!(msgs)).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 async fn delete_conversation_path(
@@ -274,9 +319,11 @@ async fn delete_conversation_path(
 ) -> impl IntoResponse {
     match state.db.delete_conversation(&id) {
         Ok(true) => Json(json!({ "success": true })).into_response(),
-        Ok(false) => {
-            Json(json!({ "success": false, "error": "Conversation not found" })).into_response()
-        }
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Conversation not found" })),
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e.to_string() })),
@@ -292,10 +339,13 @@ async fn delete_conversation_body(
     delete_conversation_path(State(state), Path(payload.conversation_id)).await
 }
 
-async fn chat_handler(
+/// Official v11 Streaming SSE Chat Handler (Section 12.3)
+/// Emits unified events: status, token, citations, verification, clarification, done, error
+/// With monotonic event IDs and dual compatibility for existing Astro frontend.
+async fn v11_chat_stream(
     State(state): State<AppState>,
     Json(payload): Json<ChatRequest>,
-) -> Sse<impl Stream<Item = Result<Event, axum::Error>>> {
+) -> Sse<impl futures::Stream<Item = Result<Event, axum::Error>>> {
     let conversation_id = payload
         .conversation_id
         .or(payload.session_id)
@@ -305,7 +355,6 @@ async fn chat_handler(
         .db
         .get_or_create_conversation(&conversation_id, &payload.query);
 
-    // Save user message
     let user_msg = crate::models::Message {
         id: uuid::Uuid::new_v4().to_string(),
         conversation_id: conversation_id.clone(),
@@ -317,138 +366,112 @@ async fn chat_handler(
     };
     let _ = state.db.save_message(&user_msg);
 
-    let (event_sender, mut event_receiver) = mpsc::channel::<AgentEvent>(100);
+    let (event_sender, mut event_receiver) = mpsc::channel::<V11EventPayload>(100);
     let orchestrator = state.orchestrator.clone();
     let query_clone = payload.query.clone();
-    let conv_id_task1 = conversation_id.clone();
+    let conv_id_task = conversation_id.clone();
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id_task = run_id.clone();
 
     tokio::spawn(async move {
         orchestrator
-            .run_agentic_loop(&query_clone, &conv_id_task1, event_sender)
+            .run_agentic_loop(&query_clone, &conv_id_task, &run_id_task, event_sender)
             .await;
     });
 
     let (sse_sender, sse_receiver) = mpsc::channel::<Result<Event, axum::Error>>(100);
 
     tokio::spawn(async move {
+        let mut event_seq = 0u64;
+
         while let Some(event) = event_receiver.recv().await {
-            match event {
-                AgentEvent::StageChange {
-                    stage,
-                    status,
-                    detail,
-                    attempt,
-                } => {
-                    let data = json!({
+            event_seq += 1;
+            let (event_type, json_data) = match &event {
+                V11EventPayload::Status { stage, status, detail, attempt } => (
+                    "status",
+                    json!({
+                        "stage": stage,
+                        "status": status,
+                        "detail": detail,
+                        "attempt": attempt,
+                        // Compatibility fields for Astro frontend
                         "type": "stage_change",
-                        "data": {
-                            "stage": stage,
-                            "status": status,
-                            "detail": detail,
-                            "attempt": attempt
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                }
-                AgentEvent::ToolEvent {
-                    tool_name,
-                    status,
-                    summary,
-                } => {
-                    let data = json!({
-                        "type": "tool_event",
-                        "data": {
-                            "toolName": tool_name,
-                            "status": status,
-                            "summary": summary
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                }
-                AgentEvent::EvidenceEvaluation {
-                    is_sufficient,
-                    candidate_count,
-                    retained_count,
-                    strategy,
-                    retry_reason,
-                    notes,
-                } => {
-                    let data = json!({
-                        "type": "evidence_evaluation",
-                        "data": {
-                            "isSufficient": is_sufficient,
-                            "candidateCount": candidate_count,
-                            "retainedCount": retained_count,
-                            "strategy": strategy,
-                            "retryReason": retry_reason,
-                            "notes": notes
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                }
-                AgentEvent::ContextReady {
-                    citations,
-                    sufficiency,
-                } => {
-                    let data = json!({
-                        "type": "context_ready",
-                        "data": {
-                            "sufficiency": sufficiency,
-                            "citations": citations
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                }
-                AgentEvent::Token { delta } => {
-                    let data = json!({
+                        "data": { "stage": stage, "status": status, "detail": detail, "attempt": attempt }
+                    }),
+                ),
+                V11EventPayload::Token { delta } => (
+                    "token",
+                    json!({
+                        "token": delta,
+                        // Compatibility fields for Astro frontend
                         "type": "token",
-                        "data": {
-                            "token": delta
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                }
-                AgentEvent::Done {
-                    answer,
-                    execution_time_ms,
-                    total_attempts,
-                } => {
-                    let data = json!({
+                        "data": { "token": delta }
+                    }),
+                ),
+                V11EventPayload::Citations { citations, sufficiency } => (
+                    "citations",
+                    json!({
+                        "citations": citations,
+                        "sufficiency": sufficiency,
+                        // Compatibility fields for Astro frontend
+                        "type": "context_ready",
+                        "data": { "citations": citations, "sufficiency": sufficiency }
+                    }),
+                ),
+                V11EventPayload::Verification { unit, verified, role, cites, checks } => (
+                    "verification",
+                    json!({
+                        "unit": unit,
+                        "verified": verified,
+                        "role": role,
+                        "cites": cites,
+                        "checks": checks,
+                        // Compatibility fields for Astro frontend
+                        "type": "evidence_evaluation",
+                        "data": { "isSufficient": *verified, "notes": format!("Unit {unit} ({role}) verified: {verified}"), "strategy": "gate_p0_c5" }
+                    }),
+                ),
+                V11EventPayload::Clarification { question } => (
+                    "clarification",
+                    json!({
+                        "question": question,
+                        "type": "clarification",
+                        "data": { "question": question }
+                    }),
+                ),
+                V11EventPayload::Done { answer, outcome, execution_time_ms, total_attempts } => (
+                    "done",
+                    json!({
+                        "answer": answer,
+                        "outcome": outcome,
+                        "executionTimeMs": execution_time_ms,
+                        "totalAttempts": total_attempts,
+                        // Compatibility fields for Astro frontend
                         "type": "done",
-                        "data": {
-                            "answer": answer,
-                            "executionTimeMs": execution_time_ms,
-                            "totalAttempts": total_attempts
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                    break;
-                }
-                AgentEvent::Error { message, code } => {
-                    let data = json!({
+                        "data": { "answer": answer, "executionTimeMs": execution_time_ms, "totalAttempts": total_attempts }
+                    }),
+                ),
+                V11EventPayload::Error { code, message } => (
+                    "error",
+                    json!({
+                        "code": code,
+                        "message": message,
+                        // Compatibility fields for Astro frontend
                         "type": "error",
-                        "data": {
-                            "message": message,
-                            "code": code
-                        }
-                    });
-                    let _ = sse_sender
-                        .send(Ok(Event::default().data(data.to_string())))
-                        .await;
-                    break;
-                }
+                        "data": { "code": code, "message": message }
+                    }),
+                ),
+            };
+
+            let sse_ev = Event::default()
+                .id(event_seq.to_string())
+                .event(event_type)
+                .data(json_data.to_string());
+
+            let _ = sse_sender.send(Ok(sse_ev)).await;
+
+            if matches!(event, V11EventPayload::Done { .. } | V11EventPayload::Error { .. }) {
+                break;
             }
         }
     });

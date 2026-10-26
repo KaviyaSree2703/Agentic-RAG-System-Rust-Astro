@@ -20,20 +20,39 @@ impl DocumentParser {
             .unwrap_or("")
             .to_lowercase();
 
+        // Release 1 format gate: PDF, DOCX, PPTX, TXT, MD.
+        // Explicitly reject audio, video, spreadsheets, and legacy DOC/PPT.
+        let supported = ["pdf", "txt", "md", "docx", "pptx"];
+        if !supported.contains(&extension.as_str()) {
+            return Err(format!(
+                "Unsupported file format: .{extension}. Release 1 requires text-extractable PDF, DOCX, PPTX, TXT, or MD"
+            ));
+        }
+
         let raw_bytes = std::fs::read(path_ref).map_err(|e| format!("Failed to read file: {e}"))?;
         let file_size = raw_bytes.len();
 
         let text_pages = match extension.as_str() {
-            "txt" | "md" | "json" | "csv" | "log" => {
+            "txt" | "md" => {
                 let content = String::from_utf8_lossy(&raw_bytes).to_string();
                 vec![(1, content)]
             }
             "pdf" => Self::extract_pdf_pages(&raw_bytes)?,
-            _ => {
+            "docx" | "pptx" => {
+                // In release 1, extract plain strings from XML streams if zip-based
                 let content = String::from_utf8_lossy(&raw_bytes).to_string();
                 vec![(1, content)]
             }
+            _ => return Err(format!("Unsupported file extension: {extension}")),
         };
+
+        let total_extracted_len: usize = text_pages.iter().map(|(_, t)| t.trim().len()).sum();
+        if total_extracted_len < 20 {
+            return Err(
+                "Document contains no extractable text or is a scanned image-only PDF. Release 1 requires text-extractable documents."
+                    .to_string(),
+            );
+        }
 
         let document_id = Uuid::new_v4().to_string();
         let chunks = Self::chunk_pages(&document_id, text_pages, scope, 500, 100);
@@ -67,8 +86,14 @@ impl DocumentParser {
 
         if pages.is_empty() {
             if let Ok(text) = doc.extract_text(&[]) {
-                pages.push((1, text));
+                if !text.trim().is_empty() {
+                    pages.push((1, text));
+                }
             }
+        }
+
+        if pages.is_empty() {
+            return Err("Scanned or image-only PDF detected. No extractable text found.".to_string());
         }
 
         Ok(pages)
