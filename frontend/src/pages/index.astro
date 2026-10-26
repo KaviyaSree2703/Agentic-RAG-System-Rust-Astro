@@ -1,0 +1,519 @@
+---
+// src/pages/index.astro
+// Agentic RAG Workspace — Main Chat & Transparent Execution View
+import AppLayout from '../layouts/AppLayout.astro';
+import ChatEmptyState from '../components/chat/ChatEmptyState.astro';
+import ChatComposer from '../components/chat/ChatComposer.astro';
+---
+
+<AppLayout title="Chat — Rust Knowledge Agent" activeRoute="chat">
+  <div class="chat-workspace">
+    <!-- Messages Scrollable Viewport -->
+    <div class="chat-scroll-area" id="chatScrollArea">
+      <div class="chat-content-column" id="chatMessageColumn">
+        <!-- Welcoming Empty State -->
+        <ChatEmptyState />
+      </div>
+    </div>
+
+    <!-- Pinned Bottom Message Composer -->
+    <ChatComposer />
+  </div>
+
+  <script>
+    import { renderMarkdown, escapeHtml } from '../lib/onyx/markdown';
+    import { streamAgentRag } from '../lib/rag/streaming';
+    import { getConversation, deleteConversation, uploadDocuments } from '../lib/rag/api';
+    import type { AgentStage, StageStatus, Citation, SufficiencyStatus, ToolInvocation, EvidenceEvaluation } from '../lib/rag/types';
+
+    // Application Chat State
+    let activeSessionId = localStorage.getItem('onyx_session_id') || ('sess_' + Math.random().toString(36).substring(2, 10));
+    localStorage.setItem('onyx_session_id', activeSessionId);
+
+    let isGenerating = false;
+    let abortController: AbortController | null = null;
+    let attachedFiles: File[] = [];
+
+    // DOM Elements
+    const chatScrollArea = document.getElementById('chatScrollArea')!;
+    const messageColumn = document.getElementById('chatMessageColumn')!;
+    const emptyState = document.getElementById('chatEmptyState')!;
+    const queryInput = document.getElementById('composerQueryInput') as HTMLTextAreaElement;
+    const sendBtn = document.getElementById('composerSendBtn') as HTMLButtonElement;
+    const stopBtn = document.getElementById('composerStopBtn') as HTMLButtonElement;
+    const attachBtn = document.getElementById('composerAttachBtn') as HTMLButtonElement;
+    const fileInput = document.getElementById('composerFileInput') as HTMLInputElement;
+    const attachmentsArea = document.getElementById('composerAttachmentsArea')!;
+    const uploadFeedback = document.getElementById('composerUploadFeedback')!;
+    const headerDeleteBtn = document.getElementById('headerDeleteChatBtn');
+    const headerNewBtn = document.getElementById('headerNewChatBtn');
+    const sidebarNewBtn = document.getElementById('sidebarNewChatBtn');
+
+    // 1. Textarea Auto-Resize & Button State
+    function updateSendState() {
+      const hasText = queryInput.value.trim().length > 0 || attachedFiles.length > 0;
+      sendBtn.disabled = !hasText || isGenerating;
+
+      if (isGenerating) {
+        sendBtn.style.display = 'none';
+        stopBtn.style.display = 'inline-flex';
+      } else {
+        sendBtn.style.display = 'inline-flex';
+        stopBtn.style.display = 'none';
+      }
+    }
+
+    function resizeInput() {
+      queryInput.style.height = 'auto';
+      queryInput.style.height = Math.min(queryInput.scrollHeight, 180) + 'px';
+    }
+
+    queryInput.addEventListener('input', () => {
+      resizeInput();
+      updateSendState();
+    });
+
+    queryInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (!sendBtn.disabled && !isGenerating) {
+          handleSendMessage();
+        }
+      }
+    });
+
+    // 2. Global Prompt Ingestion
+    (window as any).populateComposerPrompt = function(promptText: string) {
+      queryInput.value = promptText;
+      resizeInput();
+      updateSendState();
+      queryInput.focus();
+    };
+
+    // 3. Attachments & Ingestion
+    attachBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async (e) => {
+      const target = e.target as HTMLInputElement;
+      if (!target.files || target.files.length === 0) return;
+
+      const newFiles = Array.from(target.files);
+      newFiles.forEach(f => attachedFiles.push(f));
+      renderAttachmentChips();
+      updateSendState();
+
+      // Upload files to backend immediately
+      uploadFeedback.style.display = 'block';
+      uploadFeedback.innerText = `Ingesting ${newFiles.length} file(s)...`;
+      try {
+        await uploadDocuments(newFiles);
+        uploadFeedback.innerText = `Uploaded and ingested ${newFiles.length} file(s) for retrieval context.`;
+        setTimeout(() => { uploadFeedback.style.display = 'none'; }, 3500);
+      } catch (err: any) {
+        uploadFeedback.innerText = `Ingestion warning: ${err.message}`;
+        setTimeout(() => { uploadFeedback.style.display = 'none'; }, 4000);
+      }
+
+      fileInput.value = '';
+    });
+
+    function renderAttachmentChips() {
+      if (attachedFiles.length === 0) {
+        attachmentsArea.style.display = 'none';
+        attachmentsArea.innerHTML = '';
+        return;
+      }
+      attachmentsArea.style.display = 'flex';
+      attachmentsArea.innerHTML = attachedFiles.map((file, idx) => `
+        <span class="attachment-chip">
+          <span>📄</span>
+          <span>${escapeHtml(file.name)}</span>
+          <button type="button" class="btn-remove-attachment" onclick="window.removeAttachment(${idx})">✕</button>
+        </span>
+      `).join('');
+    }
+
+    (window as any).removeAttachment = function(idx: number) {
+      attachedFiles.splice(idx, 1);
+      renderAttachmentChips();
+      updateSendState();
+    };
+
+    // 4. Render Message Row with Timeline & Citations
+    function appendMessageRow(role: 'user' | 'assistant', initialHtml: string, sources: Citation[] = [], sufficiency?: SufficiencyStatus) {
+      emptyState.style.display = 'none';
+
+      const row = document.createElement('div');
+      row.className = `message-row ${role}`;
+
+      const header = document.createElement('div');
+      header.className = 'message-header';
+      header.innerHTML = role === 'user' 
+        ? '<span>You</span>' 
+        : '<span style="color:var(--brand-cyan);display:flex;align-items:center;gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>Agentic RAG Orchestrator</span>';
+      row.appendChild(header);
+
+      const bubble = document.createElement('div');
+      bubble.className = 'message-bubble';
+      bubble.innerHTML = initialHtml;
+      row.appendChild(bubble);
+
+      if (role === 'assistant') {
+        if (sufficiency) {
+          const banner = createSufficiencyBanner(sufficiency);
+          row.appendChild(banner);
+        }
+
+        if (sources && sources.length > 0) {
+          const citationPanel = createCitationPanel(sources);
+          row.appendChild(citationPanel);
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'message-actions';
+        actions.innerHTML = `
+          <button class="btn-msg-action" onclick="navigator.clipboard.writeText(this.closest('.message-row').querySelector('.message-bubble').innerText); this.innerText = 'Copied!'; setTimeout(() => this.innerText = 'Copy', 2000);">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+            <span>Copy</span>
+          </button>
+        `;
+        row.appendChild(actions);
+      }
+
+      messageColumn.appendChild(row);
+      chatScrollArea.scrollTop = chatScrollArea.scrollHeight;
+      return bubble;
+    }
+
+    function createSufficiencyBanner(sufficiency: SufficiencyStatus) {
+      const banner = document.createElement('div');
+      banner.className = `evidence-sufficiency-banner ${sufficiency}`;
+      
+      if (sufficiency === 'insufficient') {
+        banner.innerHTML = `
+          <span>⚠️</span>
+          <span><strong>Incomplete Evidence:</strong> Not enough verified evidence was found in the knowledge base to answer this query fully.</span>
+        `;
+      } else if (sufficiency === 'partial') {
+        banner.innerHTML = `
+          <span>ℹ️</span>
+          <span><strong>Partial Grounding:</strong> Some aspects of this response are supported by indexed sources, but additional documentation is recommended.</span>
+        `;
+      } else {
+        banner.innerHTML = `
+          <span>✓</span>
+          <span><strong>Verified Grounding:</strong> All assertions have been corroborated against retrieved evidence passages.</span>
+        `;
+      }
+      return banner;
+    }
+
+    function createCitationPanel(sources: Citation[]) {
+      const panel = document.createElement('div');
+      panel.className = 'citation-panel';
+      panel.innerHTML = `
+        <div class="citation-header" onclick="const list = this.nextElementSibling; const chev = this.querySelector('.chevron'); const isHidden = list.style.display === 'none'; list.style.display = isHidden ? 'flex' : 'none'; chev.innerText = isHidden ? '▲' : '▼';">
+          <div style="display:flex;align-items:center;gap:6px;">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+            <span>Evidence & Citations (${sources.length})</span>
+          </div>
+          <span class="chevron" style="font-size: 10px; color:var(--text-muted);">▼</span>
+        </div>
+        <div class="citation-list" style="display: none;">
+          ${sources.map((s, idx) => `
+            <div class="citation-card">
+              <div class="citation-meta">
+                <div class="citation-meta-left">
+                  <span>[${idx + 1}]</span>
+                  <span>📄 ${escapeHtml(s.filename || s.title || 'Document')}</span>
+                  ${s.sourceLocation ? `<span style="color:var(--text-muted);font-weight:normal;">[${escapeHtml(s.sourceLocation)}]</span>` : ''}
+                </div>
+                ${s.verified ? '<span class="status-badge success" style="font-size:9px;padding:1px 5px;">Verified</span>' : ''}
+              </div>
+              <div class="citation-snippet">${escapeHtml(s.content ? s.content.substring(0, 320) + (s.content.length > 320 ? '...' : '') : '')}</div>
+            </div>
+          `).join('')}
+        </div>
+      `;
+      return panel;
+    }
+
+    // 5. Execution Timeline Creation & Updates
+    function createLiveExecutionTimeline(containerRow: HTMLElement) {
+      const timelineBox = document.createElement('div');
+      timelineBox.className = 'agent-timeline-container';
+      timelineBox.innerHTML = `
+        <div class="agent-timeline-header open" onclick="const b = this.nextElementSibling; const chev = this.querySelector('.chevron'); const isHidden = b.style.display === 'none'; b.style.display = isHidden ? 'flex' : 'none'; chev.innerText = isHidden ? '▲' : '▼';">
+          <div class="timeline-header-left">
+            <div class="timeline-pulse-dot"></div>
+            <span class="timeline-header-title">
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>
+              <span>Agent Execution Trace</span>
+            </span>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <span class="timeline-header-meta" style="font-size:11px;">Running...</span>
+            <span class="chevron" style="font-size:10px; color:var(--text-muted);">▲</span>
+          </div>
+        </div>
+        <div class="agent-timeline-body">
+        </div>
+      `;
+      containerRow.appendChild(timelineBox);
+      return timelineBox;
+    }
+
+    function addTimelineStage(timelineEl: HTMLElement, stage: AgentStage, status: StageStatus, detail?: string, attempt?: number) {
+      const body = timelineEl.querySelector('.agent-timeline-body');
+      if (!body) return;
+
+      const stageLabels: Record<AgentStage, string> = {
+        planning: 'Planning Query Strategy',
+        tool_selection: 'Selecting Retrieval Tools',
+        retrieving: 'Retrieving Evidence Passages',
+        evaluating: 'Evaluating Evidence Grounding',
+        refining: 'Refining Search & Query Strategy',
+        building_context: 'Assembling Grounded Context',
+        generating: 'Synthesizing Answer',
+        validating: 'Validating Citations',
+        completed: 'Answer Ready',
+        failed: 'Execution Error'
+      };
+
+      const stageIcons: Record<StageStatus, string> = {
+        pending: '○',
+        in_progress: '⚡',
+        completed: '✓',
+        retrying: '↻',
+        failed: '✕',
+        skipped: '–'
+      };
+
+      const stageItem = document.createElement('div');
+      stageItem.className = 'timeline-stage-item';
+      stageItem.innerHTML = `
+        <div class="stage-bullet ${status}">${stageIcons[status] || '•'}</div>
+        <div class="stage-content">
+          <div class="stage-label-row">
+            <span class="stage-title">${stageLabels[stage] || stage} ${attempt ? `(Attempt #${attempt})` : ''}</span>
+            <span class="stage-time">${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</span>
+          </div>
+          ${detail ? `<div class="stage-detail">${escapeHtml(detail)}</div>` : ''}
+        </div>
+      `;
+      body.appendChild(stageItem);
+
+      const meta = timelineEl.querySelector('.timeline-header-meta');
+      if (meta) {
+        meta.textContent = `${stageLabels[stage] || stage}...`;
+      }
+      chatScrollArea.scrollTop = chatScrollArea.scrollHeight;
+    }
+
+    // 6. Primary Chat Completion Routine
+    async function handleSendMessage() {
+      if (isGenerating) return;
+      const query = queryInput.value.trim();
+      if (!query && attachedFiles.length === 0) return;
+
+      isGenerating = true;
+      updateSendState();
+
+      const userText = query;
+      queryInput.value = '';
+      resizeInput();
+
+      // Render user query
+      appendMessageRow('user', escapeHtml(userText));
+
+      // Create assistant container row
+      const assistantRow = document.createElement('div');
+      assistantRow.className = 'message-row assistant';
+      
+      const header = document.createElement('div');
+      header.className = 'message-header';
+      header.innerHTML = '<span style="color:var(--brand-cyan);display:flex;align-items:center;gap:4px;"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>Agentic RAG Orchestrator</span>';
+      assistantRow.appendChild(header);
+
+      // Create live timeline container
+      const timelineEl = createLiveExecutionTimeline(assistantRow);
+
+      const agentBubble = document.createElement('div');
+      agentBubble.className = 'message-bubble';
+      agentBubble.innerHTML = '<span style="color:var(--text-muted);font-size:13px;">Investigating knowledge base...</span>';
+      assistantRow.appendChild(agentBubble);
+
+      messageColumn.appendChild(assistantRow);
+      chatScrollArea.scrollTop = chatScrollArea.scrollHeight;
+
+      abortController = new AbortController();
+      let gatheredSources: Citation[] = [];
+      let reportedSufficiency: SufficiencyStatus = 'sufficient';
+      let gatheredText = '';
+      let hasReceivedTimelineEvents = false;
+
+      try {
+        await streamAgentRag({
+          query: userText,
+          conversationId: activeSessionId,
+          signal: abortController.signal,
+          onStageChange: (stage, status, detail, attempt) => {
+            hasReceivedTimelineEvents = true;
+            addTimelineStage(timelineEl, stage, status, detail, attempt);
+          },
+          onToolEvent: (tool) => {
+            hasReceivedTimelineEvents = true;
+            addTimelineStage(timelineEl, 'retrieving', tool.status === 'started' ? 'in_progress' : 'completed', `Invoked tool [${tool.toolName}]: ${tool.summary || 'Executing'}`);
+          },
+          onEvidenceEvaluation: (evalData) => {
+            hasReceivedTimelineEvents = true;
+            const evalSummary = evalData.isSufficient
+              ? `Evidence sufficient: Retained ${evalData.retainedCount} of ${evalData.candidateCount} passages.`
+              : `Evidence incomplete: Retained ${evalData.retainedCount} passages. ${evalData.retryReason ? `Refining search: ${evalData.retryReason}` : ''}`;
+            addTimelineStage(timelineEl, 'evaluating', evalData.isSufficient ? 'completed' : 'retrying', evalSummary);
+          },
+          onContextReady: (citations, sufficiency) => {
+            gatheredSources = citations;
+            reportedSufficiency = sufficiency;
+          },
+          onToken: (token) => {
+            gatheredText += token;
+            agentBubble.innerHTML = renderMarkdown(gatheredText);
+            chatScrollArea.scrollTop = chatScrollArea.scrollHeight;
+          },
+          onDone: (finalText, durationMs, totalAttempts) => {
+            agentBubble.innerHTML = renderMarkdown(finalText);
+            
+            // Mark timeline completed
+            const pulse = timelineEl.querySelector('.timeline-pulse-dot') as HTMLElement;
+            if (pulse) {
+              pulse.style.animation = 'none';
+              pulse.style.backgroundColor = 'var(--agent-grounded)';
+              pulse.style.boxShadow = 'none';
+            }
+            const meta = timelineEl.querySelector('.timeline-header-meta');
+            if (meta) {
+              meta.textContent = `Completed in ${durationMs ? (durationMs / 1000).toFixed(2) + 's' : 'done'} (${totalAttempts || 1} attempt${(totalAttempts || 1) > 1 ? 's' : ''})`;
+            }
+
+            // Append evidence sufficiency and citation drawer if sources exist
+            if (reportedSufficiency && (reportedSufficiency !== 'sufficient' || gatheredSources.length > 0)) {
+              assistantRow.appendChild(createSufficiencyBanner(reportedSufficiency));
+            }
+            if (gatheredSources.length > 0) {
+              assistantRow.appendChild(createCitationPanel(gatheredSources));
+            }
+
+            // Append copy action
+            const actions = document.createElement('div');
+            actions.className = 'message-actions';
+            actions.innerHTML = `
+              <button class="btn-msg-action" onclick="navigator.clipboard.writeText(this.closest('.message-row').querySelector('.message-bubble').innerText); this.innerText = 'Copied!'; setTimeout(() => this.innerText = 'Copy', 2000);">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>
+                <span>Copy</span>
+              </button>
+            `;
+            assistantRow.appendChild(actions);
+
+            if ((window as any).refreshSidebarConversations) {
+              (window as any).refreshSidebarConversations();
+            }
+          },
+          onError: (errMsg) => {
+            agentBubble.innerHTML = `<span style="color:var(--status-danger)">Error: ${escapeHtml(errMsg)}</span>`;
+          }
+        });
+      } catch (err: any) {
+        if (err.name === 'AbortError') {
+          agentBubble.innerHTML += '<br><span style="color:var(--text-muted);font-size:12px;">(Generation cancelled by user)</span>';
+        } else {
+          agentBubble.innerHTML = `<span style="color:var(--status-danger)">Request failed: ${escapeHtml(err.message)}</span>`;
+          queryInput.value = userText; // Preserve user draft
+          resizeInput();
+        }
+
+        // If backend did not provide any intermediate events, do not fabricate timeline
+        if (!hasReceivedTimelineEvents) {
+          timelineEl.remove();
+        }
+      } finally {
+        isGenerating = false;
+        abortController = null;
+        updateSendState();
+        queryInput.focus();
+      }
+    }
+
+    sendBtn.addEventListener('click', handleSendMessage);
+    stopBtn.addEventListener('click', () => {
+      if (abortController) {
+        abortController.abort();
+      }
+    });
+
+    // 7. Conversation Lifecycle
+    async function loadActiveSession(sessionId: string) {
+      activeSessionId = sessionId;
+      localStorage.setItem('onyx_session_id', activeSessionId);
+
+      messageColumn.innerHTML = '';
+      emptyState.style.display = 'flex';
+      messageColumn.appendChild(emptyState);
+
+      try {
+        const data = await getConversation(sessionId);
+        if (!data || !data.messages || data.messages.length === 0) {
+          return;
+        }
+
+        emptyState.style.display = 'none';
+        data.messages.forEach(m => {
+          appendMessageRow(m.role as any, renderMarkdown(m.content), m.sources || [], m.sufficiency);
+        });
+
+        chatScrollArea.scrollTop = chatScrollArea.scrollHeight;
+      } catch (err) {
+        console.warn('Failed to load session messages:', err);
+      }
+    }
+
+    function createNewSession() {
+      if (isGenerating && abortController) abortController.abort();
+      activeSessionId = 'sess_' + Math.random().toString(36).substring(2, 10);
+      localStorage.setItem('onyx_session_id', activeSessionId);
+
+      messageColumn.innerHTML = '';
+      emptyState.style.display = 'flex';
+      messageColumn.appendChild(emptyState);
+
+      const headerTitle = document.getElementById('activeConvHeaderTitle');
+      if (headerTitle) headerTitle.innerText = 'New Knowledge Session';
+
+      queryInput.value = '';
+      resizeInput();
+      updateSendState();
+      queryInput.focus();
+
+      if ((window as any).refreshSidebarConversations) {
+        (window as any).refreshSidebarConversations();
+      }
+    }
+
+    (window as any).switchChatSession = loadActiveSession;
+    (window as any).startNewChat = createNewSession;
+
+    if (headerNewBtn) headerNewBtn.addEventListener('click', createNewSession);
+    if (sidebarNewBtn) sidebarNewBtn.addEventListener('click', createNewSession);
+
+    if (headerDeleteBtn) {
+      headerDeleteBtn.addEventListener('click', async () => {
+        if (!confirm('Are you sure you want to delete this conversation?')) return;
+        await deleteConversation(activeSessionId);
+        createNewSession();
+      });
+    }
+
+    // Startup check
+    loadActiveSession(activeSessionId);
+    updateSendState();
+  </script>
+</AppLayout>

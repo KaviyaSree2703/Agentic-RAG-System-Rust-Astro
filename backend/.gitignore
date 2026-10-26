@@ -1,0 +1,9 @@
+/target
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+.env
+.env.*
+!.env.example

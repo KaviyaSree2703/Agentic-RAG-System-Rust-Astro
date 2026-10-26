@@ -1,0 +1,53 @@
+---
+// src/components/chat/ChatEmptyState.astro
+// Welcoming empty state tailored to evidence-driven knowledge retrieval
+const promptCards = [
+  {
+    title: 'Summarize a document',
+    desc: 'Explain the key ideas and cite the relevant sections.',
+    prompt: 'Summarize the core technical architecture and cite all relevant sections from the documents.'
+  },
+  {
+    title: 'Compare multiple sources',
+    desc: 'Identify agreements, contradictions, and differences.',
+    prompt: 'Compare the retrieval strategies and citation methods across our sources, highlighting any contradictions.'
+  },
+  {
+    title: 'Investigate a technical question',
+    desc: 'Retrieve supporting evidence and identify missing information.',
+    prompt: 'Retrieve supporting evidence for the multi-step reasoning mechanism and identify any missing information.'
+  },
+  {
+    title: 'Extract structured information',
+    desc: 'Organize documented specifications into a clear table.',
+    prompt: 'Extract all documented performance specifications and API schemas into a clean, structured table.'
+  }
+];
+---
+
+<div class="chat-empty-state" id="chatEmptyState">
+  <div class="empty-state-badge">
+    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <circle cx="11" cy="11" r="8"></circle>
+      <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+    </svg>
+  </div>
+  <h1 class="empty-state-title">Ask. Investigate. Verify.</h1>
+  <p class="empty-state-desc">
+    Search your knowledge base, compare evidence across sources, and get answers with traceable citations.
+  </p>
+
+  <div class="empty-prompt-grid">
+    {promptCards.map(p => (
+      <button 
+        type="button" 
+        class="empty-prompt-card" 
+        data-prompt={p.prompt}
+        onclick="window.populateComposerPrompt(this.getAttribute('data-prompt'))"
+      >
+        <span class="empty-prompt-title">{p.title}</span>
+        <span class="empty-prompt-desc">{p.desc}</span>
+      </button>
+    ))}
+  </div>
+</div>

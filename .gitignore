@@ -1,0 +1,26 @@
+# Build & compilation outputs
+target/
+/target
+dist/
+.astro/
+
+# Dependencies
+node_modules/
+
+# Local databases & volatile data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db.bak
+tantivy_index/
+rag_uploads/
+
+# Environment files with sensitive API keys
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
